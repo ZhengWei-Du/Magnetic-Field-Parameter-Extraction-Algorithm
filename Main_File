@@ -1,0 +1,955 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from sklearn.model_selection import train_test_split
+# Import StandardScaler for target value normalization
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import copy
+import sys
+
+# --- Configuration Parameters ---
+INPUT_DATA_DIR = "/home/dzw/Desktop/449-dataset/"           # Input image data (.xlsx) directory
+OUTPUT_PARAM_FILE = "/home/dzw/Desktop/tag.xlsx"            # Output parameter (.xlsx) file
+IMAGE_SIZE = 128                                           # Image size (Height=Width)
+OUTPUT_SEQ_LEN = 7                                         # Length of the output parameter sequence
+BATCH_SIZE = 32                                            # Batch size
+NUM_EPOCHS = 200                                           # Number of training epochs (increased for better data utilization)
+INITIAL_LEARNING_RATE = 0.0001                             # Initial learning rate
+CNN_OUTPUT_CHANNELS = 512                                  # CNN encoder output channels
+EMBED_DIM = 256                                            # Step embedding dimension
+HIDDEN_DIM = 512                                           # Decoder RNN hidden dimension (must be divisible by NUM_HEADS)
+NUM_DECODER_LAYERS = 2                                     # Decoder RNN layers (increased for more model capacity)
+NUM_HEADS = 8                                              # Multi-head attention heads (HIDDEN_DIM must be divisible by NUM_HEADS)
+DROPOUT = 0.2                                              # Dropout rate (can be adjusted)
+CLIP_GRAD = 1.0                                            # Gradient clipping threshold
+LR_SCHEDULER_FACTOR = 0.2                                  # Learning rate scheduler decay factor
+LR_SCHEDULER_PATIENCE = 10                                 # Learning rate scheduler patience (can be increased)
+LR_SCHEDULER_MIN_LR = 1e-7                                 # Minimum learning rate
+
+# --- New: Weighted Loss Configuration ---
+# Used to focus on improving the prediction accuracy of specific parameters. List length must equal OUTPUT_SEQ_LEN.
+# Example: Set the loss weights for the 4th (index 3) and 7th (index 6) parameters to 2.0
+WEIGHTED_LOSS_FACTORS = [2.0, 2.0, 5.0, 3.0, 1.0, 1.0, 2.0]
+assert len(WEIGHTED_LOSS_FACTORS) == OUTPUT_SEQ_LEN, "Length of WEIGHTED_LOSS_FACTORS must be equal to OUTPUT_SEQ_LEN"
+assert HIDDEN_DIM % NUM_HEADS == 0, f"Decoder hidden dimension (HIDDEN_DIM={HIDDEN_DIM}) must be divisible by the number of attention heads (NUM_HEADS={NUM_HEADS})"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"--- Using device: {DEVICE} ---")
+
+# --- Data Loading and Preprocessing ---
+def load_and_scale_image_01(filepath):
+    """Loads image data from a single Excel file, scales it, and performs checks."""
+    try:
+        # Check if file exists and is not empty
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return np.zeros((1, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+        # Read the Excel file
+        df = pd.read_excel(filepath, header=None)
+        # Check if DataFrame is empty or has incorrect shape
+        if df.empty or df.shape != (IMAGE_SIZE, IMAGE_SIZE):
+            return np.zeros((1, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+        # Convert to NumPy array
+        data = df.values.astype(np.float32)
+        # Check and clip pixel value range (15 to 63)
+        min_val, max_val = data.min(), data.max()
+        if min_val < 15 or max_val > 63:
+            data = np.clip(data, 15, 63)
+        # Scale to [0, 1] range
+        scaled_data = (data - 15.0) / (63.0 - 15.0)
+        # Add channel dimension (1, H, W)
+        return scaled_data[np.newaxis, :, :]
+    except Exception as e:
+        print(f"Error: An exception occurred while loading or scaling file {filepath}: {e}")
+        return np.zeros((1, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32) # Return zero matrix on error
+
+# --- Dataset Validation and Matching ---
+print("\n--- Starting dataset validation and matching ---")
+if not os.path.isdir(INPUT_DATA_DIR): print(f"Error: Input image directory '{INPUT_DATA_DIR}' does not exist!"); sys.exit(1)
+if not os.path.isfile(OUTPUT_PARAM_FILE): print(f"Error: Output parameter file '{OUTPUT_PARAM_FILE}' does not exist!"); sys.exit(1)
+try:
+    # Read parameter file
+    param_df_full = pd.read_excel(OUTPUT_PARAM_FILE)
+    # Check if the parameter file has enough columns (filename + OUTPUT_SEQ_LEN parameters)
+    if param_df_full.shape[1] < (1 + OUTPUT_SEQ_LEN):
+        print(f"Error: Parameter file '{OUTPUT_PARAM_FILE}' has insufficient columns ({param_df_full.shape[1]}). Expected at least {1 + OUTPUT_SEQ_LEN}."); sys.exit(1)
+except Exception as e: print(f"Error: Failed to read parameter file '{OUTPUT_PARAM_FILE}': {e}"); sys.exit(1)
+
+# Get all filenames from the parameter file (converted to string)
+param_filenames = set(param_df_full.iloc[:, 0].astype(str).tolist())
+print(f"Found {len(param_filenames)} unique filenames in the parameter file.")
+
+try:
+    # Get all .xlsx filenames from the image directory
+    actual_files = set(f for f in os.listdir(INPUT_DATA_DIR) if f.lower().endswith('.xlsx'))
+    print(f"Found {len(actual_files)} .xlsx files in the image directory '{INPUT_DATA_DIR}'.")
+except Exception as e: print(f"Error: Failed to access input directory '{INPUT_DATA_DIR}': {e}"); sys.exit(1)
+
+# Find common filenames between the parameter file and the image directory
+common_files = param_filenames.intersection(actual_files)
+print(f"Number of successfully matched files: {len(common_files)}")
+if not common_files: print("Error: No match found between filenames in the parameter file and the image directory! Please check file naming and paths."); sys.exit(1)
+
+# Filter the parameter DataFrame to keep only rows corresponding to matched files
+param_df_filtered = param_df_full[param_df_full.iloc[:, 0].astype(str).isin(common_files)].reset_index(drop=True)
+filtered_filenames = param_df_filtered.iloc[:, 0].astype(str).tolist()
+all_indices = list(range(len(filtered_filenames))) # Get indices of the filtered data
+
+# --- Dataset Splitting ---
+print("\n--- Splitting dataset (80% train, 10% validation, 10% test) ---")
+# Split into training set (80%) and a temporary set (20%)
+train_indices, temp_indices = train_test_split(all_indices, test_size=0.2, random_state=42, shuffle=True)
+# Split the temporary set into validation (50% of 20% -> 10%) and test sets (50% of 20% -> 10%)
+val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=42, shuffle=False) # No need to shuffle val/test
+print(f"Dataset index split complete: Train={len(train_indices)}, Validation={len(val_indices)}, Test={len(test_indices)}")
+# Check if any split is empty
+if not train_indices or not val_indices or not test_indices: print("Error: At least one dataset split is empty after partitioning! Please increase data volume or adjust split ratios."); sys.exit(1)
+
+# --- Calculate Image Normalization Statistics (on training set images only) ---
+print("\n--- Calculating normalization statistics (mean and std) for training set images ---")
+pixel_sum_01, pixel_sq_sum_01, num_pixels_01, valid_train_files_count = 0.0, 0.0, 0, 0
+# Get the list of filenames for the training set
+train_filenames_to_calc = param_df_filtered.iloc[train_indices, 0].astype(str).tolist()
+# Iterate through training files to calculate sum, sum of squares, and total number of pixels
+for filename in tqdm(train_filenames_to_calc, desc="Calculating image mean/std"):
+    img_path = os.path.join(INPUT_DATA_DIR, filename)
+    img_data_01 = load_and_scale_image_01(img_path) # Load and scale to [0, 1]
+    # Ensure image was loaded successfully and is not all zeros
+    if img_data_01.shape == (1, IMAGE_SIZE, IMAGE_SIZE) and np.any(img_data_01 != 0):
+        pixel_sum_01 += img_data_01.sum()
+        pixel_sq_sum_01 += (img_data_01 ** 2).sum()
+        num_pixels_01 += img_data_01.size
+        valid_train_files_count += 1
+# Calculate mean and standard deviation
+if num_pixels_01 == 0:
+    mean_01, std_01 = 0.5, 0.2 # Use default values if no valid training images are found
+    print("Warning: No valid training images found to calculate normalization stats! Using default mean=0.5, std=0.2.")
+else:
+    mean_01 = pixel_sum_01 / num_pixels_01
+    # Calculate variance, ensuring it's non-negative
+    variance_01 = max((pixel_sq_sum_01 / num_pixels_01) - (mean_01 ** 2), 0)
+    # Calculate std dev, ensuring a minimum value to prevent division by zero
+    std_01 = max(np.sqrt(variance_01), 1e-6)
+print(f"Image mean: {mean_01:.4f}, std: {std_01:.4f}, calculated from {valid_train_files_count} valid training samples.")
+# Define the image normalization transform
+img_transform = transforms.Compose([transforms.Normalize(mean=[mean_01], std=[std_01])])
+
+# --- Calculate and Apply Target Parameter Standardization ---
+print("\n--- Calculating and applying target parameter standardization (StandardScaler) ---")
+# 1. Extract target parameters for the training set (columns 1 to 1+OUTPUT_SEQ_LEN)
+train_params = param_df_filtered.iloc[train_indices, 1:1+OUTPUT_SEQ_LEN].values.astype(np.float32)
+
+# Check for NaN or Inf in training parameters
+if np.isnan(train_params).any() or np.isinf(train_params).any():
+    print("Error: The target parameters for the training set contain NaN or Inf values! Please check the original parameter file.")
+    nan_rows = np.isnan(train_params).any(axis=1)
+    inf_rows = np.isinf(train_params).any(axis=1)
+    problem_indices = np.where(nan_rows | inf_rows)[0]
+    print(f"Indices of training samples with NaN/Inf (relative to train_indices): {problem_indices}")
+    print("It is recommended to clean the original data file or remove these samples from the training set. Exiting script.")
+    sys.exit(1)
+
+# 2. Initialize and fit StandardScaler (using training data only!)
+target_scaler = StandardScaler()
+target_scaler.fit(train_params)
+
+# 3. Print original range and standardized stats of training set parameters (optional)
+print(f"Training set target parameters Original Min: {np.min(train_params, axis=0)}")
+print(f"Training set target parameters Original Max: {np.max(train_params, axis=0)}")
+print(f"Target parameter scaler Mean: {target_scaler.mean_}")
+print(f"Target parameter scaler Std (Scale): {target_scaler.scale_}")
+
+# 4. Define a function to apply standardization (will be used in Dataset)
+def standardize_targets(params, scaler):
+    """Applies standardization to input parameters (single sample or batch)."""
+    if params.ndim == 1:
+        params_reshaped = params.reshape(1, -1)
+        return scaler.transform(params_reshaped).flatten()
+    else:
+        return scaler.transform(params)
+
+# 5. Define a function for inverse standardization (will be used during evaluation)
+def inverse_standardize_targets(scaled_params, scaler):
+    """Applies inverse standardization to input parameters (single sample or batch)."""
+    if scaled_params.ndim == 1:
+        scaled_params_reshaped = scaled_params.reshape(1, -1)
+        return scaler.inverse_transform(scaled_params_reshaped).flatten()
+    else:
+        return scaler.inverse_transform(scaled_params)
+
+# --- Custom Dataset Class (Applying Target Standardization) ---
+class ImageParameterDataset(Dataset):
+    """
+    PyTorch Dataset class for loading images and their corresponding parameters.
+    It loads all filenames and raw parameters during initialization, and loads
+    images and returns standardized parameters in __getitem__.
+    """
+    def __init__(self, input_dir, param_df, file_indices, img_transform, target_scaler, dataset_name="Dataset"):
+        """
+        Initializes the dataset.
+        Args:
+            input_dir (str): Directory of image files.
+            param_df (pd.DataFrame): DataFrame with filenames and parameters (already filtered for matched files).
+            file_indices (list): List of indices in param_df belonging to this dataset split.
+            img_transform (transforms.Compose): Transformations to apply to the images (normalization).
+            target_scaler (StandardScaler): The fitted scaler for target parameter standardization.
+            dataset_name (str): Name of the dataset (for logging purposes).
+        """
+        self.input_dir = input_dir
+        self.img_transform = img_transform
+        self.target_scaler = target_scaler
+        self.dataset_name = dataset_name
+
+        # Get the subset DataFrame based on the provided indices
+        self.param_subset_df = param_df.iloc[file_indices].reset_index(drop=True)
+        initial_filenames = self.param_subset_df.iloc[:, 0].astype(str).tolist()
+        # Load raw parameter values (not yet standardized)
+        initial_parameters_raw = self.param_subset_df.iloc[:, 1:1+OUTPUT_SEQ_LEN].values.astype(np.float32)
+
+        self.filenames = []               # Stores filenames of valid samples
+        self.parameters_scaled_list = []  # Stores standardized parameters of valid samples
+        skipped_count = 0                 # Counts skipped invalid samples
+
+        # Pre-check data validity, filtering out invalid images or samples with NaN/Inf parameters
+        print(f"--- Verifying data validity for {self.dataset_name} ---")
+        for i, f in enumerate(tqdm(initial_filenames, desc=f"Verifying {self.dataset_name}")):
+            filepath = os.path.join(self.input_dir, f)
+            img_data_check = load_and_scale_image_01(filepath) # Load and check image
+            params_raw = initial_parameters_raw[i]           # Get raw parameters
+
+            # Check if image is valid (correct shape and not all zeros)
+            img_valid = img_data_check.shape == (1, IMAGE_SIZE, IMAGE_SIZE) and np.any(img_data_check != 0)
+            # Check if parameters are valid (no NaN or Inf)
+            params_valid = not (np.isnan(params_raw).any() or np.isinf(params_raw).any())
+
+            if img_valid and params_valid:
+                self.filenames.append(f)
+                # Standardize and store parameters for a single sample
+                params_scaled = standardize_targets(params_raw, self.target_scaler)
+                self.parameters_scaled_list.append(params_scaled)
+            else:
+                skipped_count += 1
+        
+        # Convert list to NumPy array for more efficient indexing later
+        self.parameters_scaled = np.array(self.parameters_scaled_list, dtype=np.float32) if self.parameters_scaled_list else np.empty((0, OUTPUT_SEQ_LEN), dtype=np.float32)
+        final_count = len(self.filenames)
+
+        if final_count == 0 and len(file_indices) > 0:
+            print(f"Warning: {self.dataset_name} has 0 valid samples after initialization! Check data quality or filtering logic.")
+        elif skipped_count > 0:
+             print(f"Note: Skipped {skipped_count} invalid samples during {self.dataset_name} initialization. Final valid sample count: {final_count}")
+        else:
+             print(f"{self.dataset_name} initialization complete. Valid sample count: {final_count}")
+
+    def __len__(self):
+        """Returns the number of valid samples in the dataset."""
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        """Loads a single sample's image and standardized parameters by index."""
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        # Get filename and image path
+        img_name = os.path.join(self.input_dir, self.filenames[idx])
+        # Load image data (already scaled to [0, 1])
+        image_data_01 = load_and_scale_image_01(img_name)
+        # Convert to PyTorch tensor
+        image = torch.from_numpy(image_data_01).float()
+        # Apply image normalization (subtract mean, divide by std)
+        if self.img_transform:
+            image = self.img_transform(image)
+
+        # Get the pre-calculated standardized parameters for the corresponding index
+        params_scaled = self.parameters_scaled[idx]
+        params_tensor = torch.from_numpy(params_scaled).float()
+
+        # Add NaN/Inf checks (defensive programming, should have been filtered during init)
+        if torch.isnan(image).any() or torch.isinf(image).any():
+            print(f"Error ({self.dataset_name}): Found image NaN/Inf in __getitem__ for {self.filenames[idx]} (index {idx})")
+            image = torch.zeros_like(image)
+        if torch.isnan(params_tensor).any() or torch.isinf(params_tensor).any():
+            print(f"Error ({self.dataset_name}): Found parameter NaN/Inf in __getitem__ for {self.filenames[idx]} (index {idx})")
+            params_tensor = torch.zeros_like(params_tensor)
+
+        return image, params_tensor # Return standardized image and parameters
+
+# --- Create Datasets and DataLoaders (passing target_scaler) ---
+print("\n--- Creating dataset instances (with target standardization) ---")
+train_dataset = ImageParameterDataset(INPUT_DATA_DIR, param_df_filtered, train_indices, img_transform, target_scaler, dataset_name="Training Set")
+val_dataset = ImageParameterDataset(INPUT_DATA_DIR, param_df_filtered, val_indices, img_transform, target_scaler, dataset_name="Validation Set")
+test_dataset = ImageParameterDataset(INPUT_DATA_DIR, param_df_filtered, test_indices, img_transform, target_scaler, dataset_name="Test Set")
+
+print("\n--- Effective Dataset Sample Counts ---")
+effective_train_count = len(train_dataset)
+effective_val_count = len(val_dataset)
+effective_test_count = len(test_dataset)
+print(f"Effective training samples: {effective_train_count}")
+print(f"Effective validation samples: {effective_val_count}")
+print(f"Effective test samples: {effective_test_count}")
+# Re-check if any dataset instance is empty
+if effective_train_count == 0 or effective_val_count == 0 or effective_test_count == 0:
+    print("Error: At least one dataset instance has 0 effective samples after creation! Check data or filtering logic."); sys.exit(1)
+
+print("\n--- Creating DataLoaders ---")
+# Determine num_workers based on the OS and device
+num_workers = 2 if DEVICE.type == 'cuda' else 0
+print(f"Using num_workers={num_workers} for DataLoaders.")
+
+# Create training DataLoader with shuffle and pin_memory (if using GPU)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), drop_last=False)
+# Create validation and test DataLoaders without shuffle
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                        num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'))
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                         num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'))
+print(f"DataLoaders created: Train batches={len(train_loader)}, Val batches={len(val_loader)}, Test batches={len(test_loader)}")
+
+# --- Model Architecture ---
+
+class EncoderCNN(nn.Module):
+    """ CNN Encoder to extract spatial features from an image. """
+    def __init__(self, output_channels=CNN_OUTPUT_CHANNELS):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            # Input: [B, 1, 128, 128]
+            nn.Conv2d(1, 64, kernel_size=5, stride=2, padding=2), # Out: [B, 64, 64, 64]
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Out: [B, 64, 32, 32]
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1), # Out: [B, 128, 32, 32]
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Out: [B, 128, 16, 16]
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1), # Added conv layer
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, output_channels, kernel_size=3, stride=1, padding=1), # Out: [B, C, 16, 16]
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2) # Out: [B, C, 8, 8], C=output_channels
+        )
+        # Store final feature map dimensions
+        self.output_H = 8
+        self.output_W = 8
+        self.num_features_spatial = output_channels * self.output_H * self.output_W # L = H'*W'
+        self.output_dim = output_channels # C
+
+    def forward(self, x):
+        """
+        Forward pass to extract features.
+        Args:
+            x (torch.Tensor): Input image tensor [B, 1, H, W]
+        Returns:
+            torch.Tensor: CNN feature map [B, C, H', W']
+        """
+        features = self.cnn(x) # Shape: [B, output_channels, H', W']
+        return features
+
+
+class DecoderRNN(nn.Module):
+    """ GRU Decoder with Multi-Head Attention. """
+    def __init__(self, embed_dim, decoder_dim, encoder_dim, output_dim, num_layers, num_heads, dropout):
+        super().__init__()
+        self.encoder_dim = encoder_dim
+        self.decoder_dim = decoder_dim
+        self.output_dim = output_dim # Usually 1
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+
+        # 1. Step embedding layer: Creates learnable embeddings for each output step (0 to OUTPUT_SEQ_LEN-1)
+        self.step_embedding = nn.Embedding(OUTPUT_SEQ_LEN, embed_dim)
+
+        # 2. Multi-Head Attention (MHA)
+        #    Query: from decoder hidden state (decoder_dim)
+        #    Key/Value: from encoder output (encoder_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=decoder_dim,
+                                               num_heads=num_heads,
+                                               kdim=encoder_dim,
+                                               vdim=encoder_dim,
+                                               dropout=dropout)
+
+        # 3. GRU Layer
+        #    Input dim = step embedding dim + context vector dim (from MHA)
+        self.rnn = nn.GRU(input_size=embed_dim + decoder_dim,
+                          hidden_size=decoder_dim,
+                          num_layers=num_layers,
+                          batch_first=True,
+                          dropout=dropout if num_layers > 1 else 0)
+
+        # 4. Output linear layer: Maps GRU output to the final parameter value
+        self.fc_out = nn.Linear(decoder_dim, output_dim)
+
+        # 5. Dropout layer (for embedding output)
+        self.dropout_layer = nn.Dropout(p=dropout)
+
+        # 6. Linear layer to generate initial hidden state from Encoder output
+        self.init_h = nn.Linear(encoder_dim, num_layers * decoder_dim)
+        self.tanh = nn.Tanh()
+
+    def create_initial_hidden_state(self, encoder_out_pooled):
+        """
+        Uses pooled Encoder features to initialize the Decoder's hidden state.
+        Args:
+            encoder_out_pooled (torch.Tensor): Pooled Encoder features [B, encoder_dim]
+        Returns:
+            torch.Tensor: Initial hidden state [num_layers, B, decoder_dim]
+        """
+        h0_flat = self.init_h(encoder_out_pooled)
+        h0_flat = self.tanh(h0_flat)
+        h0 = h0_flat.view(-1, self.num_layers, self.decoder_dim)
+        h0 = h0.permute(1, 0, 2).contiguous()
+        return h0
+
+    def forward(self, step_index, decoder_hidden, encoder_out_reshaped):
+        """
+        Performs one decoding step.
+        Args:
+            step_index (torch.Tensor): Current step index [B]
+            decoder_hidden (torch.Tensor): Previous hidden state [num_layers, B, decoder_dim]
+            encoder_out_reshaped (torch.Tensor): Reshaped Encoder output [L, B, encoder_dim]
+        Returns:
+            torch.Tensor: Prediction for the current step [B, output_dim]
+            torch.Tensor: New hidden state [num_layers, B, decoder_dim]
+            torch.Tensor: Average attention weights for the current step [B, L]
+        """
+        # 1. Get embedding for the current step
+        embedded = self.step_embedding(step_index)
+        embedded = self.dropout_layer(embedded)
+
+        # 2. Calculate multi-head attention
+        #    a) Query is the top layer of the RNN hidden state.
+        query = decoder_hidden[-1].unsqueeze(0) # [1, B, decoder_dim]
+
+        #    b) Key and Value from encoder_out_reshaped [L, B, encoder_dim]
+        #    c) Call MHA
+        context, attn_weights = self.attention(query=query,
+                                               key=encoder_out_reshaped,
+                                               value=encoder_out_reshaped,
+                                               need_weights=True)
+
+        #    d) Process outputs
+        context = context.squeeze(0) # [B, decoder_dim]
+        alpha = attn_weights.squeeze(1) # [B, L]
+
+        # 3. Prepare GRU input by concatenating embedding and context
+        rnn_input = torch.cat((embedded, context), dim=1)
+        rnn_input = rinput.unsqueeze(1) # [B, 1, embed_dim + decoder_dim]
+
+        # 4. Pass through GRU layer
+        output, hidden = self.rnn(rnn_input, decoder_hidden)
+
+        # 5. Predict parameter value
+        prediction = self.fc_out(output.squeeze(1))
+
+        return prediction, hidden, alpha
+
+class Seq2Seq(nn.Module):
+    """ The combined Encoder-Decoder Seq2Seq model. """
+    def __init__(self, encoder, decoder, device):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def forward(self, src_img):
+        """
+        Forward pass for the model.
+        Args:
+            src_img (torch.Tensor): Input image batch [B, 1, H, W]
+        Returns:
+            torch.Tensor: Predicted parameter sequence [B, OUTPUT_SEQ_LEN] (standardized scale)
+            torch.Tensor: Attention weights for each step [B, OUTPUT_SEQ_LEN, L]
+        """
+        batch_size = src_img.shape[0]
+        target_len = OUTPUT_SEQ_LEN
+        encoder_H = self.encoder.output_H
+        encoder_W = self.encoder.output_W
+        L = encoder_H * encoder_W
+
+        outputs = torch.zeros(batch_size, target_len, self.decoder.output_dim).to(self.device)
+        attentions = torch.zeros(batch_size, target_len, L).to(self.device)
+
+        # 1. Pass through Encoder
+        encoder_out = self.encoder(src_img) # [B, C, H', W']
+        encoder_dim = encoder_out.shape[1]
+
+        # 2. Prepare Encoder output for Decoder
+        #    a) Reshape for MHA Key/Value: [B, C, H', W'] -> [L, B, C]
+        encoder_out_reshaped = encoder_out.view(batch_size, encoder_dim, L).permute(2, 0, 1).contiguous()
+        #    b) Pool for initial hidden state: [B, C, H', W'] -> [B, C]
+        encoder_out_pooled = torch.mean(encoder_out, dim=[2, 3])
+
+        # 3. Initialize Decoder hidden state
+        hidden = self.decoder.create_initial_hidden_state(encoder_out_pooled)
+
+        # 4. Decoder loop to generate the output sequence
+        step_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        for t in range(target_len):
+            output, hidden, alpha = self.decoder(step_idx, hidden, encoder_out_reshaped)
+            outputs[:, t, :] = output
+            attentions[:, t, :] = alpha
+            step_idx = torch.full((batch_size,), fill_value=t + 1, dtype=torch.long, device=self.device)
+
+        outputs = outputs.squeeze(-1) # [B, target_len]
+        return outputs, attentions
+
+# --- Initialize Model, Loss, Optimizer, and Scheduler ---
+print("\n--- Initializing Model, Loss Function, Optimizer, and Scheduler ---")
+
+# Instantiate models
+encoder = EncoderCNN(output_channels=CNN_OUTPUT_CHANNELS).to(DEVICE)
+decoder = DecoderRNN(embed_dim=EMBED_DIM,
+                     decoder_dim=HIDDEN_DIM,
+                     encoder_dim=CNN_OUTPUT_CHANNELS,
+                     output_dim=1,
+                     num_layers=NUM_DECODER_LAYERS,
+                     num_heads=NUM_HEADS,
+                     dropout=DROPOUT).to(DEVICE)
+model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
+print(f'The model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters')
+
+# Define optimizer
+optimizer = optim.Adam(model.parameters(), lr=INITIAL_LEARNING_RATE)
+
+# Define learning rate scheduler
+scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+                                           factor=LR_SCHEDULER_FACTOR,
+                                           patience=LR_SCHEDULER_PATIENCE,
+                                           verbose=True,
+                                           min_lr=LR_SCHEDULER_MIN_LR)
+
+# Define loss function (base MSE, weighting will be handled in the loop)
+criterion = nn.MSELoss(reduction='none')
+
+# Convert weight factors to a tensor and move to device
+weighted_loss_factors_tensor = torch.tensor(WEIGHTED_LOSS_FACTORS, dtype=torch.float32, device=DEVICE)
+
+# --- Training and Evaluation Functions (with Weighted Loss) ---
+def train_epoch(model, dataloader, optimizer, criterion, clip, loss_weights):
+    """Executes one training epoch with weighted loss."""
+    model.train()
+    epoch_loss = 0.0
+
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for src, trg_scaled in pbar:
+        src, trg_scaled = src.to(DEVICE), trg_scaled.to(DEVICE)
+
+        optimizer.zero_grad()
+        predictions_scaled, _ = model(src)
+        elementwise_loss = criterion(predictions_scaled, trg_scaled)
+        weighted_elementwise_loss = elementwise_loss * loss_weights.unsqueeze(0)
+        loss = weighted_elementwise_loss.mean()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        optimizer.step()
+        epoch_loss += loss.item()
+        pbar.set_postfix(weighted_loss=f"{loss.item():.6f}")
+    return epoch_loss / len(dataloader)
+
+def evaluate_epoch(model, dataloader, criterion, loss_weights):
+    """Executes one evaluation epoch (on validation or test set)."""
+    model.eval()
+    epoch_loss = 0.0
+    all_attentions = []
+    all_preds_scaled = []
+    all_trgs_scaled = []
+
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Evaluating", leave=False)
+        for i, (src, trg_scaled) in enumerate(pbar):
+            src, trg_scaled = src.to(DEVICE), trg_scaled.to(DEVICE)
+            predictions_scaled, attentions = model(src)
+            elementwise_loss = criterion(predictions_scaled, trg_scaled)
+            weighted_elementwise_loss = elementwise_loss * loss_weights.unsqueeze(0)
+            loss = weighted_elementwise_loss.mean()
+            epoch_loss += loss.item()
+
+            all_preds_scaled.append(predictions_scaled.cpu().numpy())
+            all_trgs_scaled.append(trg_scaled.cpu().numpy())
+            if attentions is not None:
+                all_attentions.append(attentions.cpu().numpy())
+
+    avg_loss = epoch_loss / len(dataloader)
+    final_attentions = np.concatenate(all_attentions, axis=0) if all_attentions else None
+    final_preds_scaled = np.concatenate(all_preds_scaled, axis=0)
+    final_trgs_scaled = np.concatenate(all_trgs_scaled, axis=0)
+    return avg_loss, final_attentions, final_preds_scaled, final_trgs_scaled
+
+# --- Training Loop ---
+best_val_loss = float('inf')
+best_model_wts = None
+train_losses, val_losses, learning_rates = [], [], []
+print("\n--- Starting Training ---")
+
+for epoch in range(NUM_EPOCHS):
+    current_lr = optimizer.param_groups[0]['lr']
+    learning_rates.append(current_lr)
+    print(f"--- Epoch {epoch+1}/{NUM_EPOCHS} | Current Learning Rate: {current_lr:.7f} ---")
+
+    # Training phase
+    train_loss = train_epoch(model, train_loader, optimizer, criterion, CLIP_GRAD, weighted_loss_factors_tensor)
+    train_losses.append(train_loss)
+
+    # Evaluation phase (validation set)
+    val_loss, _, _, _ = evaluate_epoch(model, val_loader, criterion, weighted_loss_factors_tensor)
+    val_losses.append(val_loss)
+
+    scheduler.step(val_loss)
+
+    # Save the best model
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_wts = copy.deepcopy(model.state_dict())
+        print(f"  Validation Loss (Weighted MSE) improved: {val_loss:.6f}. Saving model weights...")
+        torch.save(best_model_wts, 'best_model.pth')
+    else:
+        print(f"  Validation Loss (Weighted MSE) did not improve ({val_loss:.6f}), best is: {best_val_loss:.6f}.")
+
+    print(f"  Training Loss (Weighted MSE): {train_loss:.6f}")
+    print(f"  Validation Loss (Weighted MSE): {val_loss:.6f}")
+
+print("\n--- Training Complete ---")
+
+# --- Final Evaluation on Test Set ---
+if best_model_wts is None and NUM_EPOCHS > 0:
+     print("Warning: Training finished but no best model weights were saved (validation loss may not have improved). Using the model from the last epoch for testing.")
+     best_model_wts = model.state_dict()
+elif NUM_EPOCHS == 0:
+     print("Warning: NUM_EPOCHS is 0, no training was performed.")
+     best_model_wts = None # Ensure no testing happens if no training
+
+test_attentions = None
+test_predictions_original = None
+
+if best_model_wts:
+    print("\n--- Testing on the test set with the best model ---")
+    model.load_state_dict(best_model_wts)
+    print("Loaded the best model weights saved during training.")
+
+    test_loss_weighted_scaled, test_attentions, test_predictions_scaled, test_targets_scaled = evaluate_epoch(
+        model, test_loader, criterion, weighted_loss_factors_tensor
+    )
+    print(f"Test Set Loss (Weighted Standardized MSE): {test_loss_weighted_scaled:.6f}")
+
+    # --- Calculate evaluation metrics on the original scale ---
+    print("\n--- Calculating test set evaluation metrics on the original scale ---")
+    # 1. Inverse-standardize predictions and targets
+    test_predictions_original = inverse_standardize_targets(test_predictions_scaled, target_scaler)
+    test_targets_original = inverse_standardize_targets(test_targets_scaled, target_scaler)
+
+    # 2. Calculate overall MAE on the original scale
+    mae_loss_fn = nn.L1Loss()
+    test_mae_original_overall = mae_loss_fn(torch.tensor(test_predictions_original), torch.tensor(test_targets_original))
+    print(f"Test Set Overall Mean Absolute Error (MAE, Original Scale): {test_mae_original_overall.item():.4f}")
+
+    # 3. Calculate MAE per parameter on the original scale
+    mae_per_param = np.mean(np.abs(test_predictions_original - test_targets_original), axis=0)
+    print("Test Set MAE per parameter (Original Scale):")
+    for i, mae_val in enumerate(mae_per_param):
+        print(f"  Parameter {i+1}: {mae_val:.4f}")
+
+    # 4. Calculate overall MSE on the original scale
+    mse_loss_fn = nn.MSELoss()
+    test_mse_original_overall = mse_loss_fn(torch.tensor(test_predictions_original), torch.tensor(test_targets_original))
+    print(f"Test Set Overall Mean Squared Error (MSE, Original Scale): {test_mse_original_overall.item():.4f}")
+
+else:
+    print("No valid model weights found, skipping test phase.")
+
+
+# --- Attention Visualization and Data Export ---
+
+# Function to plot attention and save upscaled attention data to CSV
+def plot_attention(image_01, result_original, attention, image_size=IMAGE_SIZE, feature_map_size=(8, 8), save_filename="attention_visualization.png"):
+    """
+    Plots the original image, predicted parameters (original scale), and attention maps for each decoding step.
+    Also saves the upsampled 128x128 attention data for each step to a corresponding CSV file.
+    """
+    n_steps = attention.shape[0]
+    L = attention.shape[1]
+    feature_h, feature_w = feature_map_size
+
+    if L != feature_h * feature_w:
+        print(f"Error: Attention weights length {L} does not match feature map size {feature_h}x{feature_w}={feature_h*feature_w}!")
+        return
+
+    fig = plt.figure(dpi=300, figsize=(17, 15))
+
+    # 1. Plot original image
+    ax = fig.add_subplot(3, 3, 1)
+    ax.imshow(image_01.squeeze(0).cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+    ax.set_title("Original Image (0-1 Range)")
+    ax.axis('off')
+
+    # 2. Display predicted parameters
+    param_text = "\n".join([f"Parameter {i+1}: {res:.2f}" for i, res in enumerate(result_original)])
+    ax = fig.add_subplot(3, 3, 2)
+    ax.text(0.1, 0.5, param_text, fontsize=10, va='center')
+    ax.set_title("Predicted Parameters (Original Scale)")
+    ax.axis('off')
+
+    all_upsampled_maps = []
+    csv_column_names = []
+
+    # 3. Plot attention maps for each step (up to 7)
+    plot_limit = min(n_steps, 7)
+    print(f"--- Generating and preparing to save {plot_limit} steps of 128x128 attention data for {os.path.basename(save_filename)} ---")
+    for i in range(plot_limit):
+        ax = fig.add_subplot(3, 3, i + 3)
+
+        attn_map_raw = attention[i, :].reshape((feature_h, feature_w))
+        attn_map_tensor = torch.tensor(attn_map_raw).unsqueeze(0).unsqueeze(0)
+        upsampled_attn_tensor = nn.functional.interpolate(
+            attn_map_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False
+        )
+        upsampled_attn = upsampled_attn_tensor.squeeze().cpu().numpy()
+
+        all_upsampled_maps.append(upsampled_attn.flatten())
+        csv_column_names.append(f"Param_{i+1}_Attention_Weight")
+
+        ax.imshow(image_01.squeeze(0).cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+        im = ax.imshow(upsampled_attn, cmap='inferno', alpha=0.7)
+        ax.set_title(f"Attention Distribution (Parameter {i+1})")
+        ax.axis('off')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    try:
+        sample_id_for_title = "_".join(os.path.basename(save_filename).split('_')[2:]).replace('.png','')
+    except:
+        sample_id_for_title = os.path.basename(save_filename)
+    plt.suptitle(f"Sample {sample_id_for_title} Attention Visualization", fontsize=14)
+    fig.subplots_adjust(top=0.92)
+    plt.savefig(save_filename)
+    print(f"Attention visualization image saved to: {save_filename}")
+    plt.close(fig)
+
+    # --- Save 128x128 attention data to CSV ---
+    if all_upsampled_maps:
+        try:
+            csv_filename = save_filename.replace('attention_vis', 'attention_data_128x128').replace('.png', '.csv')
+            csv_data_array = np.stack(all_upsampled_maps, axis=1)
+            attn_data_df = pd.DataFrame(csv_data_array, columns=csv_column_names)
+            
+            pixel_indices = np.arange(image_size * image_size)
+            row_coords = pixel_indices // image_size
+            col_coords = pixel_indices % image_size
+            attn_data_df.insert(0, 'Image_Col', col_coords)
+            attn_data_df.insert(0, 'Image_Row', row_coords)
+            
+            attn_data_df.to_csv(csv_filename, index=False, float_format='%.8f')
+            print(f"Corresponding 128x128 attention distribution data saved to: {csv_filename}")
+            print(f"  - CSV file contains {attn_data_df.shape[0]} rows (each pixel) and {len(csv_column_names)+2} columns.")
+            print(f"  - The first two columns are 'Image_Row' and 'Image_Col' coordinates (0-indexed).")
+            print(f"  - Subsequent columns correspond to the upscaled heatmap data overlaid on the PNG subplots.")
+        except Exception as e_csv_save:
+            print(f"Error: Failed to save 128x128 attention data to CSV ({csv_filename}): {e_csv_save}")
+    else:
+        print("Warning: No upsampled attention maps were collected; cannot save CSV.")
+
+
+# --- Save All 128x128 Attention Matrices for the Test Set ---
+if (test_dataset and effective_test_count > 0 and
+    test_attentions is not None and test_attentions.shape[0] > 0 and encoder is not None):
+
+    print("\n--- Saving all 128x128 attention matrices for the test set to individual CSV files ---")
+    FULL_ATTENTION_OUTPUT_DIR = "full_testset_attention_matrices"
+    os.makedirs(FULL_ATTENTION_OUTPUT_DIR, exist_ok=True)
+
+    feature_h, feature_w = encoder.output_H, encoder.output_W
+    L = feature_h * feature_w
+    seq_len = OUTPUT_SEQ_LEN
+
+    for idx in tqdm(range(effective_test_count), desc=f"Saving all attention matrices to '{FULL_ATTENTION_OUTPUT_DIR}'"):
+        try:
+            original_filename = test_dataset.filenames[idx]
+            clean_filename = os.path.basename(original_filename).replace(".xlsx", "")
+            current_sample_attentions = test_attentions[idx]
+
+            if current_sample_attentions.shape != (seq_len, L):
+                print(f"Warning: Attention weights for sample {idx} have incorrect shape {current_sample_attentions.shape}, expected ({seq_len}, {L}). Skipping.")
+                continue
+
+            for param_idx in range(seq_len):
+                attn_map_raw = current_sample_attentions[param_idx, :].reshape((feature_h, feature_w))
+                attn_map_tensor = torch.tensor(attn_map_raw).unsqueeze(0).unsqueeze(0)
+                upsampled_attn_tensor = nn.functional.interpolate(
+                    attn_map_tensor, size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False
+                )
+                upsampled_attn = upsampled_attn_tensor.squeeze().cpu().numpy()
+                csv_path = os.path.join(FULL_ATTENTION_OUTPUT_DIR, f"{clean_filename}_param{param_idx+1}_attention_128x128.csv")
+                np.savetxt(csv_path, upsampled_attn, delimiter=',', fmt='%.8f')
+        except Exception as e:
+            print(f"Error: An exception occurred while saving attention matrix for sample {idx} ({original_filename}): {e}")
+            continue
+
+    print(f"All 128x128 attention matrices for the test set have been successfully saved to the '{FULL_ATTENTION_OUTPUT_DIR}' folder.")
+else:
+    print("Warning: Cannot save all 128x128 attention matrices. Reason might be: empty test set, failed evaluation, or missing model weights/attention results.")
+
+
+# --- Save Training History and Plot Curves ---
+if NUM_EPOCHS > 0 and train_losses and val_losses and learning_rates:
+    print("\n--- Saving training process data to training_log.csv ---")
+    try:
+        if len(train_losses) == NUM_EPOCHS and len(val_losses) == NUM_EPOCHS and len(learning_rates) == NUM_EPOCHS:
+            epochs = list(range(1, NUM_EPOCHS + 1))
+            training_log_df = pd.DataFrame({
+                'Epoch': epochs,
+                'Train_Loss_Weighted_Std': train_losses,
+                'Validation_Loss_Weighted_Std': val_losses,
+                'Learning_Rate': learning_rates
+            })
+            training_log_df.to_csv('training_log.csv', index=False, float_format='%.8f')
+            print("Training process data saved to training_log.csv")
+        else:
+            print("Warning: Length mismatch in training history lists, cannot save training log.")
+    except Exception as e:
+        print(f"Error: Failed to save training process data to CSV: {e}")
+
+    print("\n--- Plotting and saving loss (weighted standardized) and learning rate curves ---")
+    fig, ax1 = plt.subplots(dpi=300, figsize=(12, 6))
+
+    color = 'tab:red'
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Weighted Standardized MSE Loss', color=color)
+    ax1.plot(range(1, len(train_losses) + 1), train_losses, color=color, linestyle='-', label='Training Loss (Weighted Std)')
+    ax1.plot(range(1, len(val_losses) + 1), val_losses, color=color, linestyle='--', label='Validation Loss (Weighted Std)')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.legend(loc='upper left')
+    ax1.grid(True)
+
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Learning Rate', color=color)
+    ax2.plot(range(1, len(learning_rates) + 1), learning_rates, color=color, marker='.', linestyle=':', label='Learning Rate')
+    ax2.tick_params(axis='y', labelcolor=color)
+    ax2.set_yscale('log')
+    ax2.legend(loc='upper right')
+
+    fig.tight_layout()
+    plt.title('Training/Validation Loss (Weighted Standardized) and Learning Rate')
+    plt.savefig('loss_lr_curve_weighted_scaled.png')
+    plt.close(fig)
+    print("Loss (weighted standardized) and learning rate curve plot saved as loss_lr_curve_weighted_scaled.png")
+else:
+    print("No training was performed (NUM_EPOCHS=0), skipping plotting of loss curves.")
+
+# --- Visualize Specific Samples from the Test Set ---
+if (test_dataset and effective_test_count > 0 and
+    test_attentions is not None and test_predictions_original is not None):
+
+    sample_indices_to_plot = list(range(min(3, effective_test_count)))
+
+    print(f"\n--- Generating attention visualization plots for test set indices {sample_indices_to_plot} ---")
+
+    for idx in sample_indices_to_plot:
+        if idx < effective_test_count and idx < len(test_attentions) and idx < len(test_predictions_original):
+            try:
+                original_filename = test_dataset.filenames[idx]
+                img_path_vis = os.path.join(INPUT_DATA_DIR, original_filename)
+                original_image_01 = torch.from_numpy(load_and_scale_image_01(img_path_vis)).float()
+
+                predicted_params_original_sample = test_predictions_original[idx]
+                attention_weights_sample = test_attentions[idx] # [SEQ_LEN, L]
+
+                clean_filename = os.path.basename(original_filename).replace(".xlsx", "")
+                save_filename = f'attention_vis_sample_{idx}_{clean_filename}.png'
+                
+                # Also save the raw attention weights for this sample to a CSV
+                try:
+                    feature_h, feature_w = encoder.output_H, encoder.output_W
+                    L = feature_h * feature_w
+                    seq_len = OUTPUT_SEQ_LEN
+                    if attention_weights_sample.shape == (seq_len, L):
+                        col_names = [f'Feature_{i}' for i in range(L)]
+                        row_names = [f'Param_{i + 1}_Step' for i in range(seq_len)]
+                        attn_df = pd.DataFrame(attention_weights_sample, index=row_names, columns=col_names)
+                        save_csv_filename = f'attention_data_sample_{idx}_{clean_filename}.csv'
+                        attn_df.to_csv(save_csv_filename, float_format='%.6f')
+                        print(f"Raw attention weights for sample {idx} saved to: {save_csv_filename}")
+                    else:
+                        print(f"Warning: Shape of attention weights for sample {idx} is {attention_weights_sample.shape}, expected ({seq_len}, {L}). Skipping CSV save.")
+                except Exception as e_csv:
+                    print(f"Error saving raw attention weights CSV for sample {idx}: {e_csv}")
+
+                if torch.any(original_image_01 != 0) and original_image_01.shape == (1, IMAGE_SIZE, IMAGE_SIZE):
+                    plot_attention(image_01=original_image_01,
+                                   result_original=predicted_params_original_sample,
+                                   attention=attention_weights_sample,
+                                   image_size=IMAGE_SIZE,
+                                   feature_map_size=(encoder.output_H, encoder.output_W),
+                                   save_filename=save_filename)
+                else:
+                    print(f"Could not load or image is invalid, skipping visualization for sample index {idx} (file: {original_filename})")
+            except Exception as e:
+                 print(f"An error occurred while generating visualization for sample index {idx} (file: {original_filename}): {e}")
+        else:
+            print(f"Sample index {idx} is out of valid range, skipping visualization.")
+else:
+    print("Cannot generate attention plots. Reason may be: empty test set, failed evaluation, missing model weights, or no attention/prediction results were collected.")
+
+# --- Save Detailed Test Set Predictions and Errors to CSV ---
+print("\n--- Saving detailed test set prediction results and errors to CSV ---")
+
+if ('test_dataset' in locals() and hasattr(test_dataset, 'filenames') and
+    'test_targets_original' in locals() and test_targets_original is not None and
+    'test_predictions_original' in locals() and test_predictions_original is not None and
+    'effective_test_count' in locals() and effective_test_count > 0 and
+    len(test_dataset.filenames) == effective_test_count and
+    test_targets_original.shape == (effective_test_count, OUTPUT_SEQ_LEN) and
+    test_predictions_original.shape == (effective_test_count, OUTPUT_SEQ_LEN)):
+
+    try:
+        filenames = test_dataset.filenames
+        targets = test_targets_original
+        predictions = test_predictions_original
+        errors = np.abs(predictions - targets)
+        sample_mae = np.mean(errors, axis=1)
+
+        data_to_save = {'Filename': filenames}
+        for i in range(OUTPUT_SEQ_LEN):
+            param_index = i + 1
+            data_to_save[f'True_Param_{param_index}'] = targets[:, i]
+            data_to_save[f'Pred_Param_{param_index}'] = predictions[:, i]
+            data_to_save[f'Abs_Error_{param_index}'] = errors[:, i]
+        data_to_save['Sample_Mean_Abs_Error'] = sample_mae
+
+        results_df = pd.DataFrame(data_to_save)
+        
+        column_order = ['Filename']
+        for i in range(OUTPUT_SEQ_LEN):
+            param_index = i + 1
+            column_order.extend([f'True_Param_{param_index}', f'Pred_Param_{param_index}', f'Abs_Error_{param_index}'])
+        column_order.append('Sample_Mean_Abs_Error')
+        results_df = results_df[column_order]
+
+        csv_filename = 'test_predictions_and_errors.csv'
+        results_df.to_csv(csv_filename, index=False, float_format='%.6f')
+
+        print(f"Detailed comparison of test set predictions and errors saved to: {csv_filename}")
+        print(f"  - CSV file contains {results_df.shape[0]} rows (one for each test sample) and {results_df.shape[1]} columns.")
+    except Exception as e:
+        print(f"Error: Failed to save test set results and errors to CSV: {e}")
+
+else:
+    print("Warning: Cannot generate CSV file for test set results and errors.")
+    print("  Possible reasons:")
+    print("  - The test set is empty (effective_test_count=0).")
+    print("  - The test evaluation phase did not run successfully or was skipped.")
+    print("  - The variables 'test_targets_original' or 'test_predictions_original' were not generated correctly or have an incorrect format.")
+
+print("\n--- Script execution finished ---")
