@@ -1,4 +1,4 @@
-First, the data corresponding to the images in the paper can be found in the [Figures_data] folder, where each image is matched with its respective data.
+First, the data corresponding to the images in the paper can be found in the [Results data from the manuscript] folder, where each image is matched with its respective data.
 
 Additionally, the training/validation sets and the test set used in the article are available in the [train&validation] and [test] folders, respectively.
 
